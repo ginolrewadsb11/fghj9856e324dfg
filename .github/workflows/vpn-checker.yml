@@ -21,7 +21,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests aiohttp asyncio base64
+          pip install aiohttp
 
       - name: Run VPN checker
         env:
