@@ -1,0 +1,37 @@
+name: VPN Keys Checker
+
+on:
+  schedule:
+    # Запуск каждые 6 часов
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Ручной запуск
+
+jobs:
+  check-keys:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests aiohttp asyncio base64
+
+      - name: Run VPN checker
+        env:
+          SUBSCRIPTION_URLS: ${{ secrets.SUBSCRIPTION_URLS }}
+        run: python scripts/vpn_checker.py
+
+      - name: Commit and push results
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add vpn.txt
+          git diff --staged --quiet || git commit -m "Update working VPN keys - $(date +'%Y-%m-%d %H:%M')"
+          git push
