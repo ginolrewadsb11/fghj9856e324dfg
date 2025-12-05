@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 """
 VPN Keys Checker - проверяет ключи из подписок и сохраняет рабочие
-Поддерживает: vless://, vmess://, ss://, socks://, trojan://, hysteria2://
+Поддерживает: vless://, vmess://, ss://, trojan://, hysteria2://
+Полная проверка через xray-core
 """
 
 import os
 import base64
 import asyncio
-import socket
-import re
-from urllib.parse import urlparse, parse_qs, unquote
+import json
+import subprocess
+import tempfile
+import time
+from urllib.parse import urlparse, unquote
 from typing import Optional
 import aiohttp
 
 # Таймаут для проверки (секунды)
-TIMEOUT = 10
+TIMEOUT = 15
 # Максимум одновременных проверок
-MAX_CONCURRENT = 50
+MAX_CONCURRENT = 10
+# URL для проверки соединения
+TEST_URL = "https://www.google.com/generate_204"
 
 
 def decode_base64(data: str) -> str:
     """Декодирует base64 с padding"""
     try:
-        # Добавляем padding если нужно
         padding = 4 - len(data) % 4
         if padding != 4:
             data += '=' * padding
@@ -38,14 +42,12 @@ def parse_subscription(content: str) -> list[str]:
     """Парсит содержимое подписки и возвращает список ключей"""
     keys = []
     
-    # Пробуем декодировать base64
     decoded = decode_base64(content.strip())
     if decoded:
         content = decoded
     
-    # Ищем все протоколы
-    protocols = ['vless://', 'vmess://', 'ss://', 'socks://', 'socks5://', 
-                 'trojan://', 'hysteria2://', 'hy2://', 'hysteria://']
+    protocols = ['vless://', 'vmess://', 'ss://', 'trojan://', 
+                 'hysteria2://', 'hy2://', 'hysteria://']
     
     for line in content.split('\n'):
         line = line.strip()
@@ -55,82 +57,291 @@ def parse_subscription(content: str) -> list[str]:
     return keys
 
 
-def extract_host_port(key: str) -> Optional[tuple[str, int]]:
-    """Извлекает хост и порт из ключа"""
+def parse_vless(uri: str) -> Optional[dict]:
+    """Парсит VLESS URI в конфиг xray"""
     try:
-        if key.startswith('vmess://'):
-            # VMess - base64 JSON
-            data = decode_base64(key[8:])
-            if data:
-                import json
-                config = json.loads(data)
-                return config.get('add'), int(config.get('port', 443))
+        parsed = urlparse(uri)
+        uuid = parsed.username
+        host = parsed.hostname
+        port = parsed.port or 443
         
-        elif key.startswith(('vless://', 'trojan://', 'hysteria2://', 'hy2://', 'hysteria://')):
-            # vless://uuid@host:port?params#name
-            parsed = urlparse(key)
-            if parsed.hostname and parsed.port:
-                return parsed.hostname, parsed.port
+        params = dict(p.split('=') for p in parsed.query.split('&') if '=' in p)
         
-        elif key.startswith('ss://'):
-            # ss://base64@host:port#name или ss://base64#name
-            key_part = key[5:]
-            if '@' in key_part:
-                # Формат: method:pass@host:port
-                host_part = key_part.split('@')[1].split('#')[0]
-                if ':' in host_part:
-                    host, port = host_part.rsplit(':', 1)
-                    return host, int(port)
-            else:
-                # Полностью закодировано
-                decoded = decode_base64(key_part.split('#')[0])
-                if '@' in decoded:
-                    host_part = decoded.split('@')[1]
-                    if ':' in host_part:
-                        host, port = host_part.rsplit(':', 1)
-                        return host, int(port)
+        security = params.get('security', 'none')
+        transport = params.get('type', 'tcp')
         
-        elif key.startswith(('socks://', 'socks5://')):
-            parsed = urlparse(key)
-            if parsed.hostname and parsed.port:
-                return parsed.hostname, parsed.port
-                
+        outbound = {
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": host,
+                    "port": port,
+                    "users": [{"id": uuid, "encryption": "none"}]
+                }]
+            },
+            "streamSettings": {
+                "network": transport
+            }
+        }
+        
+        # TLS/Reality настройки
+        if security == "tls":
+            outbound["streamSettings"]["security"] = "tls"
+            outbound["streamSettings"]["tlsSettings"] = {
+                "serverName": params.get('sni', host),
+                "allowInsecure": True
+            }
+        elif security == "reality":
+            outbound["streamSettings"]["security"] = "reality"
+            outbound["streamSettings"]["realitySettings"] = {
+                "serverName": params.get('sni', ''),
+                "fingerprint": params.get('fp', 'chrome'),
+                "publicKey": params.get('pbk', ''),
+                "shortId": params.get('sid', '')
+            }
+        
+        # Transport настройки
+        if transport == "ws":
+            outbound["streamSettings"]["wsSettings"] = {
+                "path": unquote(params.get('path', '/')),
+                "headers": {"Host": params.get('host', host)}
+            }
+        elif transport == "grpc":
+            outbound["streamSettings"]["grpcSettings"] = {
+                "serviceName": params.get('serviceName', '')
+            }
+        elif transport == "tcp" and params.get('headerType') == 'http':
+            outbound["streamSettings"]["tcpSettings"] = {
+                "header": {"type": "http", "request": {"path": [params.get('path', '/')]}}
+            }
+        
+        return outbound
     except Exception as e:
-        pass
-    
-    return None
+        return None
 
 
-async def check_tcp_connection(host: str, port: int, timeout: int = TIMEOUT) -> bool:
-    """Проверяет TCP соединение с хостом"""
+def parse_vmess(uri: str) -> Optional[dict]:
+    """Парсит VMess URI в конфиг xray"""
     try:
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port),
-            timeout=timeout
-        )
-        writer.close()
-        await writer.wait_closed()
-        return True
+        data = json.loads(decode_base64(uri[8:]))
+        
+        outbound = {
+            "protocol": "vmess",
+            "settings": {
+                "vnext": [{
+                    "address": data.get('add'),
+                    "port": int(data.get('port', 443)),
+                    "users": [{
+                        "id": data.get('id'),
+                        "alterId": int(data.get('aid', 0)),
+                        "security": data.get('scy', 'auto')
+                    }]
+                }]
+            },
+            "streamSettings": {
+                "network": data.get('net', 'tcp')
+            }
+        }
+        
+        if data.get('tls') == 'tls':
+            outbound["streamSettings"]["security"] = "tls"
+            outbound["streamSettings"]["tlsSettings"] = {
+                "serverName": data.get('sni', data.get('host', '')),
+                "allowInsecure": True
+            }
+        
+        net = data.get('net', 'tcp')
+        if net == 'ws':
+            outbound["streamSettings"]["wsSettings"] = {
+                "path": data.get('path', '/'),
+                "headers": {"Host": data.get('host', '')}
+            }
+        elif net == 'grpc':
+            outbound["streamSettings"]["grpcSettings"] = {
+                "serviceName": data.get('path', '')
+            }
+        
+        return outbound
     except Exception:
-        return False
+        return None
 
 
-async def check_key(key: str, semaphore: asyncio.Semaphore) -> Optional[str]:
-    """Проверяет один ключ, возвращает его если работает"""
-    async with semaphore:
-        result = extract_host_port(key)
-        if not result:
-            return None
+def parse_trojan(uri: str) -> Optional[dict]:
+    """Парсит Trojan URI в конфиг xray"""
+    try:
+        parsed = urlparse(uri)
+        password = unquote(parsed.username)
+        host = parsed.hostname
+        port = parsed.port or 443
         
-        host, port = result
-        print(f"Checking: {host}:{port}")
+        params = dict(p.split('=') for p in parsed.query.split('&') if '=' in p)
         
-        if await check_tcp_connection(host, port):
-            print(f"  ✓ Working: {host}:{port}")
-            return key
+        outbound = {
+            "protocol": "trojan",
+            "settings": {
+                "servers": [{
+                    "address": host,
+                    "port": port,
+                    "password": password
+                }]
+            },
+            "streamSettings": {
+                "network": params.get('type', 'tcp'),
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": params.get('sni', host),
+                    "allowInsecure": True
+                }
+            }
+        }
+        
+        return outbound
+    except Exception:
+        return None
+
+
+def parse_shadowsocks(uri: str) -> Optional[dict]:
+    """Парсит Shadowsocks URI в конфиг xray"""
+    try:
+        key_part = uri[5:].split('#')[0]
+        
+        if '@' in key_part:
+            method_pass, host_port = key_part.rsplit('@', 1)
+            decoded = decode_base64(method_pass)
+            if ':' in decoded:
+                method, password = decoded.split(':', 1)
+            else:
+                return None
+            host, port = host_port.rsplit(':', 1)
         else:
-            print(f"  ✗ Failed: {host}:{port}")
+            decoded = decode_base64(key_part)
+            if '@' in decoded:
+                method_pass, host_port = decoded.rsplit('@', 1)
+                method, password = method_pass.split(':', 1)
+                host, port = host_port.rsplit(':', 1)
+            else:
+                return None
+        
+        outbound = {
+            "protocol": "shadowsocks",
+            "settings": {
+                "servers": [{
+                    "address": host,
+                    "port": int(port),
+                    "method": method,
+                    "password": password
+                }]
+            }
+        }
+        
+        return outbound
+    except Exception:
+        return None
+
+
+def key_to_xray_config(key: str, socks_port: int) -> Optional[dict]:
+    """Конвертирует ключ в полный xray конфиг"""
+    outbound = None
+    
+    if key.startswith('vless://'):
+        outbound = parse_vless(key)
+    elif key.startswith('vmess://'):
+        outbound = parse_vmess(key)
+    elif key.startswith('trojan://'):
+        outbound = parse_trojan(key)
+    elif key.startswith('ss://'):
+        outbound = parse_shadowsocks(key)
+    
+    if not outbound:
+        return None
+    
+    outbound["tag"] = "proxy"
+    
+    config = {
+        "log": {"loglevel": "error"},
+        "inbounds": [{
+            "port": socks_port,
+            "listen": "127.0.0.1",
+            "protocol": "socks",
+            "settings": {"udp": False}
+        }],
+        "outbounds": [outbound]
+    }
+    
+    return config
+
+
+async def check_key_with_xray(key: str, semaphore: asyncio.Semaphore, port_counter: list) -> Optional[str]:
+    """Проверяет ключ через xray-core"""
+    async with semaphore:
+        # Получаем уникальный порт
+        port_counter[0] += 1
+        socks_port = 10000 + (port_counter[0] % 5000)
+        
+        config = key_to_xray_config(key, socks_port)
+        if not config:
             return None
+        
+        # Создаём временный конфиг
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(config, f)
+            config_path = f.name
+        
+        process = None
+        try:
+            # Запускаем xray
+            process = subprocess.Popen(
+                ['xray', 'run', '-c', config_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            
+            # Даём время на подключение
+            await asyncio.sleep(2)
+            
+            if process.poll() is not None:
+                # Процесс упал
+                return None
+            
+            # Проверяем соединение через прокси
+            proxy = f"socks5://127.0.0.1:{socks_port}"
+            
+            try:
+                connector = aiohttp.TCPConnector(ssl=False)
+                timeout = aiohttp.ClientTimeout(total=TIMEOUT)
+                
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    async with session.get(
+                        TEST_URL,
+                        proxy=proxy,
+                        allow_redirects=False
+                    ) as response:
+                        if response.status in [200, 204, 301, 302]:
+                            # Извлекаем имя для лога
+                            name = key.split('#')[-1][:30] if '#' in key else key[:50]
+                            print(f"  ✓ Working: {name}")
+                            return key
+            except Exception as e:
+                pass
+            
+            return None
+            
+        except Exception as e:
+            return None
+        finally:
+            # Убиваем xray
+            if process and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except:
+                    process.kill()
+            
+            # Удаляем конфиг
+            try:
+                os.unlink(config_path)
+            except:
+                pass
 
 
 async def fetch_subscription(url: str) -> str:
@@ -146,20 +357,27 @@ async def fetch_subscription(url: str) -> str:
 
 
 async def main():
-    # Получаем URL подписок из переменной окружения
+    # Проверяем наличие xray
+    try:
+        result = subprocess.run(['xray', 'version'], capture_output=True, text=True)
+        print(f"Using: {result.stdout.split(chr(10))[0]}")
+    except FileNotFoundError:
+        print("ERROR: xray not found! Install xray-core first.")
+        return
+    
+    # Получаем URL подписок
     subscription_urls = os.environ.get('SUBSCRIPTION_URLS', '')
     
     if not subscription_urls:
-        # Если нет в env, пробуем прочитать из файла
         if os.path.exists('subscriptions.txt'):
             with open('subscriptions.txt', 'r') as f:
                 subscription_urls = f.read()
     
-    urls = [url.strip() for url in subscription_urls.split('\n') if url.strip()]
+    urls = [url.strip() for url in subscription_urls.split('\n') 
+            if url.strip() and not url.strip().startswith('#')]
     
     if not urls:
         print("No subscription URLs found!")
-        print("Set SUBSCRIPTION_URLS secret or create subscriptions.txt file")
         return
     
     all_keys = []
@@ -167,7 +385,7 @@ async def main():
     # Загружаем все подписки
     print(f"Fetching {len(urls)} subscriptions...")
     for url in urls:
-        print(f"Fetching: {url[:50]}...")
+        print(f"Fetching: {url[:60]}...")
         content = await fetch_subscription(url)
         if content:
             keys = parse_subscription(content)
@@ -183,9 +401,11 @@ async def main():
         return
     
     # Проверяем все ключи
-    print("\nChecking keys...")
+    print("\nChecking keys with xray (this may take a while)...")
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-    tasks = [check_key(key, semaphore) for key in all_keys]
+    port_counter = [0]
+    
+    tasks = [check_key_with_xray(key, semaphore, port_counter) for key in all_keys]
     results = await asyncio.gather(*tasks)
     
     # Фильтруем рабочие
@@ -196,11 +416,9 @@ async def main():
     
     # Сохраняем результат
     if working_keys:
-        # Сохраняем в plain text
         with open('vpn.txt', 'w') as f:
             f.write('\n'.join(working_keys))
         
-        # Также сохраняем в base64 формате (стандарт для подписок)
         encoded = base64.b64encode('\n'.join(working_keys).encode()).decode()
         with open('vpn_base64.txt', 'w') as f:
             f.write(encoded)
@@ -208,7 +426,6 @@ async def main():
         print(f"Saved to vpn.txt and vpn_base64.txt")
     else:
         print("No working keys found!")
-        # Создаём пустой файл чтобы git не ругался
         with open('vpn.txt', 'w') as f:
             f.write('')
 

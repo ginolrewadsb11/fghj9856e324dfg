@@ -26,7 +26,15 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install aiohttp
+          pip install aiohttp aiohttp-socks
+
+      - name: Install Xray-core
+        run: |
+          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q Xray-linux-64.zip -d xray
+          sudo mv xray/xray /usr/local/bin/
+          sudo chmod +x /usr/local/bin/xray
+          xray version
 
       - name: Run VPN checker
         env:
