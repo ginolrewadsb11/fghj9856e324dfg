@@ -17,11 +17,19 @@ from typing import Optional
 import aiohttp
 
 # Таймаут для проверки (секунды)
-TIMEOUT = 15
-# Максимум одновременных проверок
-MAX_CONCURRENT = 10
-# URL для проверки соединения
-TEST_URL = "https://www.google.com/generate_204"
+TIMEOUT = 25
+# Время ожидания запуска xray
+XRAY_STARTUP_DELAY = 3
+# Максимум одновременных проверок (меньше = надёжнее)
+MAX_CONCURRENT = 5
+# Количество попыток для каждого ключа
+MAX_RETRIES = 2
+# URL для проверки соединения (несколько для надёжности)
+TEST_URLS = [
+    "https://www.google.com/generate_204",
+    "https://cp.cloudflare.com/",
+    "https://www.gstatic.com/generate_204"
+]
 
 
 def decode_base64(data: str) -> str:
@@ -271,8 +279,28 @@ def key_to_xray_config(key: str, socks_port: int) -> Optional[dict]:
     return config
 
 
+async def test_proxy_connection(proxy: str, timeout: int) -> bool:
+    """Тестирует прокси соединение через несколько URL"""
+    connector = aiohttp.TCPConnector(ssl=False, force_close=True)
+    client_timeout = aiohttp.ClientTimeout(total=timeout, connect=10)
+    
+    async with aiohttp.ClientSession(connector=connector, timeout=client_timeout) as session:
+        for test_url in TEST_URLS:
+            try:
+                async with session.get(
+                    test_url,
+                    proxy=proxy,
+                    allow_redirects=False
+                ) as response:
+                    if response.status in [200, 204, 301, 302, 403]:
+                        return True
+            except:
+                continue
+    return False
+
+
 async def check_key_with_xray(key: str, semaphore: asyncio.Semaphore, port_counter: list, checked: list, total: int) -> Optional[str]:
-    """Проверяет ключ через xray-core"""
+    """Проверяет ключ через xray-core с повторными попытками"""
     async with semaphore:
         # Получаем уникальный порт и номер проверки
         port_counter[0] += 1
@@ -297,71 +325,66 @@ async def check_key_with_xray(key: str, semaphore: asyncio.Semaphore, port_count
             checked[0] += 1
             return None
         
-        # Создаём временный конфиг
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(config, f)
-            config_path = f.name
-        
-        process = None
-        try:
-            # Запускаем xray
-            process = subprocess.Popen(
-                ['xray', 'run', '-c', config_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
+        # Пробуем несколько раз
+        for attempt in range(1, MAX_RETRIES + 1):
+            # Создаём временный конфиг
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                json.dump(config, f)
+                config_path = f.name
             
-            # Даём время на подключение
-            await asyncio.sleep(1.5)
-            
-            if process.poll() is not None:
-                print(f"  ✗ Xray crashed", flush=True)
-                checked[0] += 1
-                return None
-            
-            # Проверяем соединение через прокси
-            proxy = f"socks5://127.0.0.1:{socks_port}"
-            
+            process = None
             try:
-                connector = aiohttp.TCPConnector(ssl=False)
-                timeout = aiohttp.ClientTimeout(total=TIMEOUT)
+                # Запускаем xray
+                process = subprocess.Popen(
+                    ['xray', 'run', '-c', config_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
                 
-                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                    async with session.get(
-                        TEST_URL,
-                        proxy=proxy,
-                        allow_redirects=False
-                    ) as response:
-                        if response.status in [200, 204, 301, 302]:
-                            print(f"  ✓ WORKING!", flush=True)
-                            checked[0] += 1
-                            return key
-            except asyncio.TimeoutError:
-                print(f"  ✗ Timeout", flush=True)
+                # Даём время на подключение (больше для первой попытки)
+                await asyncio.sleep(XRAY_STARTUP_DELAY if attempt == 1 else 2)
+                
+                if process.poll() is not None:
+                    if attempt == MAX_RETRIES:
+                        print(f"  ✗ Xray crashed", flush=True)
+                    continue
+                
+                # Проверяем соединение через прокси
+                proxy = f"socks5://127.0.0.1:{socks_port}"
+                
+                if await test_proxy_connection(proxy, TIMEOUT):
+                    print(f"  ✓ WORKING! (attempt {attempt})", flush=True)
+                    checked[0] += 1
+                    return key
+                
+                if attempt < MAX_RETRIES:
+                    print(f"  ⟳ Retry {attempt + 1}/{MAX_RETRIES}...", flush=True)
+                    
             except Exception as e:
-                print(f"  ✗ Error: {type(e).__name__}", flush=True)
-            
-            checked[0] += 1
-            return None
-            
-        except Exception as e:
-            print(f"  ✗ Exception: {e}", flush=True)
-            checked[0] += 1
-            return None
-        finally:
-            # Убиваем xray
-            if process and process.poll() is None:
-                process.terminate()
+                if attempt == MAX_RETRIES:
+                    print(f"  ✗ Exception: {e}", flush=True)
+            finally:
+                # Убиваем xray
+                if process and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except:
+                        process.kill()
+                
+                # Удаляем конфиг
                 try:
-                    process.wait(timeout=2)
+                    os.unlink(config_path)
                 except:
-                    process.kill()
-            
-            # Удаляем конфиг
-            try:
-                os.unlink(config_path)
-            except:
-                pass
+                    pass
+                
+                # Пауза между попытками
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(1)
+        
+        print(f"  ✗ Failed after {MAX_RETRIES} attempts", flush=True)
+        checked[0] += 1
+        return None
 
 
 async def fetch_subscription(url: str) -> str:
