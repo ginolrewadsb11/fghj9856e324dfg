@@ -271,15 +271,30 @@ def key_to_xray_config(key: str, socks_port: int) -> Optional[dict]:
     return config
 
 
-async def check_key_with_xray(key: str, semaphore: asyncio.Semaphore, port_counter: list) -> Optional[str]:
+async def check_key_with_xray(key: str, semaphore: asyncio.Semaphore, port_counter: list, checked: list, total: int) -> Optional[str]:
     """Проверяет ключ через xray-core"""
     async with semaphore:
-        # Получаем уникальный порт
+        # Получаем уникальный порт и номер проверки
         port_counter[0] += 1
-        socks_port = 10000 + (port_counter[0] % 5000)
+        current_num = port_counter[0]
+        socks_port = 10000 + (current_num % 5000)
+        
+        # Извлекаем имя/хост для лога
+        if '#' in key:
+            name = unquote(key.split('#')[-1])[:40]
+        else:
+            try:
+                parsed = urlparse(key)
+                name = f"{parsed.hostname}:{parsed.port}"
+            except:
+                name = key[:40]
+        
+        print(f"[{current_num}/{total}] Checking: {name}", flush=True)
         
         config = key_to_xray_config(key, socks_port)
         if not config:
+            print(f"  ✗ Failed to parse config", flush=True)
+            checked[0] += 1
             return None
         
         # Создаём временный конфиг
@@ -297,10 +312,11 @@ async def check_key_with_xray(key: str, semaphore: asyncio.Semaphore, port_count
             )
             
             # Даём время на подключение
-            await asyncio.sleep(2)
+            await asyncio.sleep(1.5)
             
             if process.poll() is not None:
-                # Процесс упал
+                print(f"  ✗ Xray crashed", flush=True)
+                checked[0] += 1
                 return None
             
             # Проверяем соединение через прокси
@@ -317,16 +333,20 @@ async def check_key_with_xray(key: str, semaphore: asyncio.Semaphore, port_count
                         allow_redirects=False
                     ) as response:
                         if response.status in [200, 204, 301, 302]:
-                            # Извлекаем имя для лога
-                            name = key.split('#')[-1][:30] if '#' in key else key[:50]
-                            print(f"  ✓ Working: {name}")
+                            print(f"  ✓ WORKING!", flush=True)
+                            checked[0] += 1
                             return key
+            except asyncio.TimeoutError:
+                print(f"  ✗ Timeout", flush=True)
             except Exception as e:
-                pass
+                print(f"  ✗ Error: {type(e).__name__}", flush=True)
             
+            checked[0] += 1
             return None
             
         except Exception as e:
+            print(f"  ✗ Exception: {e}", flush=True)
+            checked[0] += 1
             return None
         finally:
             # Убиваем xray
@@ -401,11 +421,13 @@ async def main():
         return
     
     # Проверяем все ключи
-    print("\nChecking keys with xray (this may take a while)...")
+    total = len(all_keys)
+    print(f"\nChecking {total} keys with xray...\n", flush=True)
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     port_counter = [0]
+    checked = [0]
     
-    tasks = [check_key_with_xray(key, semaphore, port_counter) for key in all_keys]
+    tasks = [check_key_with_xray(key, semaphore, port_counter, checked, total) for key in all_keys]
     results = await asyncio.gather(*tasks)
     
     # Фильтруем рабочие
